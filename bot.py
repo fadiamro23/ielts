@@ -2,35 +2,32 @@ import asyncio
 import logging
 import sqlite3
 import os
+import requests
 from gtts import gTTS
+from deep_translator import GoogleTranslator
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configuration
-API_TOKEN = '8755826845:AAF4BuprTKC451oYeXh4z8dQatr8c-7bA1s'
+API_TOKEN = os.getenv('API_TOKEN')
 DB_NAME = 'ielts_bot.db'
 
 logging.basicConfig(level=logging.INFO)
 
+# Check if token is loaded properly
+if not API_TOKEN:
+    logging.error("API_TOKEN is not set. Please check your .env file.")
+    exit(1)
+
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Initialize Database and Tables
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    # Create users table to store custom words_per_day
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            words_per_day INTEGER DEFAULT 5
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-# Fetch user settings (default to 5 if not found)
+# Fetch user settings
 def get_user_settings(user_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -51,24 +48,58 @@ def set_user_settings(user_id, count):
 def get_daily_words(limit):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, word, english_def FROM words WHERE status = 'new' LIMIT ?", (limit,))
+    cursor.execute("SELECT id, word, english_def, arabic_meaning, example_sentence FROM words WHERE status = 'new' LIMIT ?", (limit,))
     words = cursor.fetchall()
     conn.close()
     return words
 
+# Update word with Arabic meaning and Example in database
+def update_word_details(word_id, arabic, example):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE words SET arabic_meaning = ?, example_sentence = ? WHERE id = ?", (arabic, example, word_id))
+    conn.commit()
+    conn.close()
+
+# Helper function to fetch translation and example dynamically
+def fetch_translation_and_example(word):
+    # 1. Translate to Arabic
+    try:
+        arabic_meaning = GoogleTranslator(source='en', target='ar').translate(word)
+    except Exception as e:
+        logging.error(f"Translation error for {word}: {e}")
+        arabic_meaning = "Translation unavailable"
+
+    # 2. Fetch Example from Free Dictionary API
+    example_sentence = "No example available in dictionary."
+    try:
+        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            # Parse JSON to find the first available example
+            for meaning in data[0].get('meanings', []):
+                for defn in meaning.get('definitions', []):
+                    if 'example' in defn:
+                        example_sentence = defn['example']
+                        break
+                if example_sentence != "No example available in dictionary.":
+                    break
+    except Exception as e:
+        logging.error(f"Dictionary API error for {word}: {e}")
+
+    return arabic_meaning, example_sentence
+
 # Generate audio file using gTTS and send it
 async def generate_and_send_audio(chat_id, word):
     try:
-        # Create audio
         tts = gTTS(text=word, lang='en', slow=False)
         filename = f"temp_audio_{word}.mp3"
         tts.save(filename)
         
-        # Send voice message
         voice_file = FSInputFile(filename)
         await bot.send_voice(chat_id=chat_id, voice=voice_file)
         
-        # Remove file after sending to free up space
         os.remove(filename)
     except Exception as e:
         logging.error(f"Error generating audio for {word}: {e}")
@@ -77,7 +108,7 @@ async def generate_and_send_audio(chat_id, word):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    set_user_settings(user_id, 5) # Set default limit
+    set_user_settings(user_id, 5) 
     
     welcome_text = (
         "Welcome to the IELTS Vocabulary System.\n"
@@ -114,10 +145,20 @@ async def cmd_study(message: types.Message):
     await message.answer(f"Fetching your {len(words)} words for today...")
 
     for w in words:
-        word_id, word_text, english_def = w
+        word_id, word_text, english_def, arabic_meaning, example_sentence = w
         
-        # Format the text message
-        msg_text = f"Word: {word_text}\nDefinition: {english_def}"
+        # If translation or example is missing in DB, fetch and update
+        if not arabic_meaning or not example_sentence:
+            arabic_meaning, example_sentence = fetch_translation_and_example(word_text)
+            update_word_details(word_id, arabic_meaning, example_sentence)
+        
+        # Format the text message with all details
+        msg_text = (
+            f"Word: {word_text}\n"
+            f"Arabic: {arabic_meaning}\n"
+            f"Definition: {english_def}\n"
+            f"Example: {example_sentence}"
+        )
         await message.answer(msg_text)
         
         # Generate and send pronunciation
@@ -128,7 +169,6 @@ async def cmd_study(message: types.Message):
 
 # Main function
 async def main():
-    init_db()
     logging.info("Starting bot...")
     await dp.start_polling(bot)
 
