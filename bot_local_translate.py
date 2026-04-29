@@ -238,8 +238,8 @@ class LocalTranslator:
         # Keep use_safetensors=False for NLLB because your logs showed problematic
         # safetensors/PR resolution attempts.
         load_kwargs = {
-            "torch_dtype": torch.float32,
-            "low_cpu_mem_usage": False,
+    "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
+    "low_cpu_mem_usage": False,
         }
 
         if self.backend == "nllb":
@@ -262,8 +262,8 @@ class LocalTranslator:
 
         # Move once to GPU after loading.
         if self.device == "cuda":
-            logging.info("Moving model to CUDA in FP16...")
-            self.model = self.model.half().to(self.device)
+            logging.info("Moving FP16 model to CUDA...")
+            self.model = self.model.to(self.device)
         else:
             logging.warning("CUDA is not available. Running translation on CPU.")
             self.model = self.model.to(self.device)
