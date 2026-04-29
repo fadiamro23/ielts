@@ -176,7 +176,7 @@ class LocalTranslator:
         # On 24GB cards this can briefly duplicate weights in GPU memory and cause OOM.
         # device_map="auto" places weights directly and more safely.
         load_kwargs = {
-            "dtype": self.dtype,
+            "torch_dtype": self.dtype,
             "low_cpu_mem_usage": True,
             "use_safetensors": False,
         }
