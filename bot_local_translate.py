@@ -171,19 +171,31 @@ class LocalTranslator:
 
         logging.info("Loading translation backend=%s model=%s device=%s", backend, model_name, self.device)
 
+        # IMPORTANT:
+        # Do not load the model first and then call .to("cuda") for large models.
+        # On 24GB cards this can briefly duplicate weights in GPU memory and cause OOM.
+        # device_map="auto" places weights directly and more safely.
+        load_kwargs = {
+            "dtype": self.dtype,
+            "low_cpu_mem_usage": True,
+        }
+        if self.device == "cuda":
+            load_kwargs["device_map"] = "auto"
+
         if self.backend == "madlad":
             self.tokenizer = T5Tokenizer.from_pretrained(model_name)
             self.model = T5ForConditionalGeneration.from_pretrained(
                 model_name,
-                dtype=self.dtype,
-                device_map="auto" if self.device == "cuda" else None
+                **load_kwargs
             )
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
                 model_name,
-                dtype=self.dtype
-            ).to(self.device)
+                **load_kwargs
+            )
+            if self.device != "cuda":
+                self.model.to(self.device)
 
         self.model.eval()
         logging.info("Translation model loaded successfully.")
@@ -199,8 +211,7 @@ class LocalTranslator:
             return self._translate_nllb(text)
 
     def _translate_nllb(self, text: str) -> str:
-        # NLLB language codes
-        self.tokenizer.src_lang = "eng_Latn"
+        model_device = next(self.model.parameters()).device
 
         inputs = self.tokenizer(
             text,
@@ -208,7 +219,7 @@ class LocalTranslator:
             padding=True,
             truncation=True,
             max_length=256
-        ).to(self.device)
+        ).to(model_device)
 
         outputs = self.model.generate(
             **inputs,
