@@ -178,9 +178,10 @@ class LocalTranslator:
         load_kwargs = {
             "dtype": self.dtype,
             "low_cpu_mem_usage": True,
+            "use_safetensors": False,
         }
         if self.device == "cuda":
-            load_kwargs["device_map"] = "auto"
+            load_kwargs["device_map"] = {"": 0}
 
         if self.backend == "madlad":
             self.tokenizer = T5Tokenizer.from_pretrained(model_name)
