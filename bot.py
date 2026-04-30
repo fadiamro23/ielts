@@ -3,51 +3,38 @@ import logging
 import sqlite3
 import os
 import requests
+import json
 from gtts import gTTS
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
 from dotenv import load_dotenv
-from transformers import pipeline
+import google.generativeai as genai
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configuration
 API_TOKEN = os.getenv('API_TOKEN')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 DB_NAME = 'ielts_bot.db'
-
-# Using the 600M model to avoid the CUDA Out of Memory error you experienced.
-# If you free up enough GPU memory (approx 4GB+), you can change this back to "facebook/nllb-200-1.3B".
-NLLB_MODEL = "facebook/nllb-200-1.3B"
 
 logging.basicConfig(level=logging.INFO)
 
-if not API_TOKEN:
-    logging.error("API_TOKEN is not set. Please check your .env file.")
+if not API_TOKEN or not GEMINI_API_KEY:
+    logging.error("API_TOKEN or GEMINI_API_KEY is not set. Please check your .env file.")
     exit(1)
+
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+# Using flash model for high speed and enabling JSON response format
+llm_model = genai.GenerativeModel(
+    'gemini-1.5-flash',
+    generation_config={"response_mime_type": "application/json"}
+)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
-
-# ---------------------------------------------------------
-# Initialize NLLB Translation Pipeline Globally
-# This loads the model into GPU/RAM only once when starting
-# ---------------------------------------------------------
-logging.info(f"Loading translation model: {NLLB_MODEL}...")
-try:
-    translator_pipe = pipeline(
-        "translation",
-        model=NLLB_MODEL,
-        src_lang="eng_Latn",
-        tgt_lang="arb_Arab",
-        device=0  # Uses GPU 0. Change to -1 for CPU if GPU is completely full.
-    )
-    logging.info("Model loaded successfully.")
-except Exception as e:
-    logging.error(f"Failed to load translation model: {e}")
-    exit(1)
-
 
 # ---------------------------------------------------------
 # Database Functions
@@ -56,7 +43,6 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Ensure users table exists
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -64,13 +50,10 @@ def init_db():
         )
     ''')
     
-    # Auto-migrate database to add new columns for English and Arabic examples
-    # if they don't exist already.
     try:
         cursor.execute("ALTER TABLE words ADD COLUMN example_sentence_en TEXT")
         cursor.execute("ALTER TABLE words ADD COLUMN example_sentence_ar TEXT")
     except sqlite3.OperationalError:
-        # Columns already exist, which is fine
         pass
         
     conn.commit()
@@ -94,7 +77,6 @@ def set_user_settings(user_id, count):
 def get_daily_words(limit):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Fetch words that haven't been studied yet
     cursor.execute("""
         SELECT id, word, english_def, arabic_meaning, example_sentence_en, example_sentence_ar 
         FROM words WHERE status = 'new' LIMIT ?
@@ -106,7 +88,6 @@ def get_daily_words(limit):
 def update_word_details(word_id, arabic, example_en, example_ar):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Update word with translations and mark status as 'learning'
     cursor.execute("""
         UPDATE words 
         SET arabic_meaning = ?, example_sentence_en = ?, example_sentence_ar = ?, status = 'learning'
@@ -115,14 +96,13 @@ def update_word_details(word_id, arabic, example_en, example_ar):
     conn.commit()
     conn.close()
 
-
 # ---------------------------------------------------------
-# Translation & API Logic
+# Translation & API Logic via Gemini
 # ---------------------------------------------------------
-def fetch_and_translate_sync(word):
+def fetch_and_translate_sync(word, english_def):
     """
-    This function blocks the thread because of the model pipeline.
-    It fetches the English example via API, then uses NLLB to translate the word and the example.
+    Fetches an English example via API, then uses Google Gemini 
+    to translate the word and the example accurately based on context.
     """
     # 1. Fetch Example from API
     example_sentence_en = "No example available in dictionary."
@@ -141,21 +121,38 @@ def fetch_and_translate_sync(word):
     except Exception as e:
         logging.error(f"Dictionary API error for '{word}': {e}")
 
-    # 2. Translate using local NLLB model
+    # 2. Translate using Gemini
     try:
-        # Translate the main word
-        arabic_meaning = translator_pipe(word)[0]['translation_text']
+        prompt = f"""
+        أنت أستاذ لغة إنجليزية محترف متخصص في مساعدة الطلاب لاجتياز اختبار IELTS.
         
-        # Translate the example sentence if it exists
-        if example_sentence_en != "No example available in dictionary.":
-            example_sentence_ar = translator_pipe(example_sentence_en)[0]['translation_text']
-        else:
-            example_sentence_ar = "لا يوجد مثال متوفر لترجمته."
-            
+        الكلمة الإنجليزية: {word}
+        التعريف الإنجليزي: {english_def}
+        المثال الإنجليزي: {example_sentence_en}
+
+        بناءً على التعريف الإنجليزي أعلاه لتحديد السياق بدقة، المطلوب:
+        1. ترجمة الكلمة إلى اللغة العربية بأدق معنى لها.
+        2. ترجمة المثال الإنجليزي إلى لغة عربية فصحى، مفهومة، واحترافية.
+        
+        يجب أن تكون المخرجات بصيغة JSON فقط كالتالي:
+        {{
+            "arabic_meaning": "ترجمة الكلمة هنا",
+            "example_ar": "ترجمة المثال هنا"
+        }}
+        """
+
+        response = llm_model.generate_content(prompt)
+        
+        # Parse JSON
+        result = json.loads(response.text)
+        
+        arabic_meaning = result.get('arabic_meaning', 'تعذر استخراج الترجمة')
+        example_sentence_ar = result.get('example_ar', 'تعذر استخراج المثال')
+
     except Exception as e:
-        logging.error(f"NLLB Translation error for '{word}': {e}")
-        arabic_meaning = "Translation error"
-        example_sentence_ar = "Translation error"
+        logging.error(f"Gemini Translation error for '{word}': {e}")
+        arabic_meaning = "خطأ في الترجمة"
+        example_sentence_ar = "خطأ في الترجمة"
 
     return arabic_meaning, example_sentence_en, example_sentence_ar
 
@@ -172,10 +169,9 @@ async def generate_and_send_audio(chat_id, word):
         voice_file = FSInputFile(filename)
         await bot.send_voice(chat_id=chat_id, voice=voice_file)
         
-        os.remove(filename)  # Clean up after sending
+        os.remove(filename) 
     except Exception as e:
         logging.error(f"Error generating audio for '{word}': {e}")
-
 
 # ---------------------------------------------------------
 # Bot Handlers & Commands
@@ -183,10 +179,10 @@ async def generate_and_send_audio(chat_id, word):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    set_user_settings(user_id, 5) # Default limit
+    set_user_settings(user_id, 5) 
     
     welcome_text = (
-        "Welcome to the IELTS Vocabulary System.\n"
+        "Welcome to the IELTS Vocabulary System! 🎓\n"
         "Default setting: 5 words per day.\n\n"
         "Commands:\n"
         "/study - Get your words for today\n"
@@ -215,7 +211,7 @@ async def cmd_study(message: types.Message):
         await message.answer("No new words available in the database. You have finished them all!")
         return
 
-    await message.answer(f"Fetching your {len(words)} words for today... Please wait while the AI translates them.")
+    await message.answer(f"Fetching your {len(words)} words for today... The AI is preparing professional translations!")
 
     for w in words:
         word_id = w[0]
@@ -225,10 +221,9 @@ async def cmd_study(message: types.Message):
         example_en = w[4]
         example_ar = w[5]
         
-        # If translation or examples are missing, process them in a background thread
+        # Translate if not already translated
         if not arabic_meaning or not example_en or not example_ar:
-            # asyncio.to_thread prevents the bot from freezing while the heavy AI model is working
-            arabic_meaning, example_en, example_ar = await asyncio.to_thread(fetch_and_translate_sync, word_text)
+            arabic_meaning, example_en, example_ar = await asyncio.to_thread(fetch_and_translate_sync, word_text, english_def)
             update_word_details(word_id, arabic_meaning, example_en, example_ar)
         
         # Format the final message
@@ -241,11 +236,9 @@ async def cmd_study(message: types.Message):
         )
         await message.answer(msg_text)
         
-        # Generate and send pronunciation
+        # Send audio
         await generate_and_send_audio(user_id, word_text)
-        
-        # Short pause to respect Telegram API limits
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0)
 
 
 # ---------------------------------------------------------
