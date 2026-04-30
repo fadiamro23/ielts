@@ -19,7 +19,7 @@ DB_NAME = 'ielts_bot.db'
 
 # Using the 600M model to avoid the CUDA Out of Memory error you experienced.
 # If you free up enough GPU memory (approx 4GB+), you can change this back to "facebook/nllb-200-1.3B".
-NLLB_MODEL = "facebook/nllb-200-distilled-600M"
+NLLB_MODEL = "facebook/nllb-200-1.3B"
 
 logging.basicConfig(level=logging.INFO)
 
