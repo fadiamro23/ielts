@@ -114,22 +114,24 @@ def fetch_and_translate_sync(word, english_def):
     except Exception as e:
         logging.error(f"Dictionary API error for '{word}': {e}")
 
-    # 2. Translate using Groq API
+    # 2. Translate and Generate via Groq API
     try:
         prompt = f"""
         أنت أستاذ لغة إنجليزية محترف متخصص في مساعدة الطلاب لاجتياز اختبار IELTS.
         
         الكلمة الإنجليزية: {word}
         التعريف الإنجليزي: {english_def}
-        المثال الإنجليزي: {example_sentence_en}
+        المثال من القاموس: {example_sentence_en}
 
-        المطلوب:
+        المطلوب بدقة:
         1. ترجمة الكلمة إلى اللغة العربية بأدق معنى أكاديمي لها.
-        2. ترجمة المثال الإنجليزي إلى لغة عربية فصحى، مفهومة، واحترافية.
+        2. إذا كان "المثال من القاموس" هو "No example available in dictionary."، قم أنت بتأليف مثال إنجليزي أكاديمي قوي ومناسب لاختبار IELTS يحتوي على الكلمة المعنية، ثم ترجمه للعربية.
+        3. إذا كان هناك مثال حقيقي من القاموس، فقم بترجمته فقط.
         
         يجب أن يكون المخرج بصيغة JSON حصراً بهذا الشكل:
         {{
             "arabic_meaning": "ترجمة الكلمة هنا",
+            "example_en": "المثال الإنجليزي النهائي (سواء من القاموس أو من تأليفك)",
             "example_ar": "ترجمة المثال هنا"
         }}
         """
@@ -154,14 +156,16 @@ def fetch_and_translate_sync(word, english_def):
         result = json.loads(result_text)
         
         arabic_meaning = result.get('arabic_meaning', 'تعذر استخراج الترجمة')
+        final_example_en = result.get('example_en', example_sentence_en)
         example_sentence_ar = result.get('example_ar', 'تعذر استخراج المثال')
 
     except Exception as e:
         logging.error(f"Groq Translation error for '{word}': {e}")
         arabic_meaning = "خطأ في الترجمة"
+        final_example_en = example_sentence_en
         example_sentence_ar = "خطأ في الترجمة"
 
-    return arabic_meaning, example_sentence_en, example_sentence_ar
+    return arabic_meaning, final_example_en, example_sentence_ar
 
 
 # ---------------------------------------------------------
