@@ -10,26 +10,25 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
 from dotenv import load_dotenv
 
-# استدعاء مكتبة جوجل الجديدة
-from google import genai
-from google.genai import types as genai_types
+# استدعاء مكتبة Groq
+from groq import Groq
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
 API_TOKEN = os.getenv('API_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 DB_NAME = 'ielts_bot.db'
 
 logging.basicConfig(level=logging.INFO)
 
-if not API_TOKEN or not GEMINI_API_KEY:
-    logging.error("API_TOKEN or GEMINI_API_KEY is not set. Please check your .env file.")
+if not API_TOKEN or not GROQ_API_KEY:
+    logging.error("API_TOKEN or GROQ_API_KEY is not set. Please check your .env file.")
     exit(1)
 
-# Configure the new Gemini Client
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# Configure the Groq Client
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -95,14 +94,10 @@ def update_word_details(word_id, arabic, example_en, example_ar):
     conn.close()
 
 # ---------------------------------------------------------
-# Translation & API Logic via Gemini (New SDK)
+# Translation & API Logic via Groq (Llama 3 70B)
 # ---------------------------------------------------------
 def fetch_and_translate_sync(word, english_def):
-    """
-    Fetches an English example via API, then uses the new Google GenAI SDK
-    to translate the word and the example accurately based on context.
-    """
-    # 1. Fetch Example from Free Dictionary API
+    # 1. Fetch Example from API
     example_sentence_en = "No example available in dictionary."
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
@@ -119,7 +114,7 @@ def fetch_and_translate_sync(word, english_def):
     except Exception as e:
         logging.error(f"Dictionary API error for '{word}': {e}")
 
-    # 2. Translate using Gemini (New SDK Format)
+    # 2. Translate using Groq API
     try:
         prompt = f"""
         أنت أستاذ لغة إنجليزية محترف متخصص في مساعدة الطلاب لاجتياز اختبار IELTS.
@@ -128,34 +123,41 @@ def fetch_and_translate_sync(word, english_def):
         التعريف الإنجليزي: {english_def}
         المثال الإنجليزي: {example_sentence_en}
 
-        بناءً على التعريف الإنجليزي أعلاه لتحديد السياق بدقة، المطلوب:
-        1. ترجمة الكلمة إلى اللغة العربية بأدق معنى لها.
+        المطلوب:
+        1. ترجمة الكلمة إلى اللغة العربية بأدق معنى أكاديمي لها.
         2. ترجمة المثال الإنجليزي إلى لغة عربية فصحى، مفهومة، واحترافية.
         
-        يجب أن تكون المخرجات بصيغة JSON فقط كالتالي:
+        يجب أن يكون المخرج بصيغة JSON حصراً بهذا الشكل:
         {{
             "arabic_meaning": "ترجمة الكلمة هنا",
             "example_ar": "ترجمة المثال هنا"
         }}
         """
 
-        # Using the standard model for structured translation
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-            )
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a translation API that outputs valid JSON only."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"},
         )
         
         # Parse JSON
-        result = json.loads(response.text)
+        result_text = chat_completion.choices[0].message.content
+        result = json.loads(result_text)
         
         arabic_meaning = result.get('arabic_meaning', 'تعذر استخراج الترجمة')
         example_sentence_ar = result.get('example_ar', 'تعذر استخراج المثال')
 
     except Exception as e:
-        logging.error(f"Gemini Translation error for '{word}': {e}")
+        logging.error(f"Groq Translation error for '{word}': {e}")
         arabic_meaning = "خطأ في الترجمة"
         example_sentence_ar = "خطأ في الترجمة"
 
@@ -227,7 +229,7 @@ async def cmd_study(message: types.Message):
         example_en = w[4]
         example_ar = w[5]
         
-        # Translate if not already translated
+        # Translate if not already translated or if previous attempt failed
         if not arabic_meaning or not example_en or not example_ar or arabic_meaning == "خطأ في الترجمة":
             arabic_meaning, example_en, example_ar = await asyncio.to_thread(fetch_and_translate_sync, word_text, english_def)
             update_word_details(word_id, arabic_meaning, example_en, example_ar)
