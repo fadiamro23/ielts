@@ -1,19 +1,25 @@
 # bot_local_translate.py
-# IELTS Vocabulary Telegram Bot with local translation backend.
-# Supports:
-#   - NLLB:   facebook/nllb-200-1.3B or facebook/nllb-200-distilled-600M
-#   - MADLAD: google/madlad400-3b-mt
+# IELTS Vocabulary Telegram Bot with local English -> Arabic translation.
+#
+# What this version does:
+# - Translates IELTS word to Arabic using local NLLB/MADLAD.
+# - Translates the English definition to Arabic.
+# - Gets/generates an English example sentence.
+# - Translates the example sentence to Arabic.
+# - Shows all of that in /study.
 #
 # Recommended run:
 #   export TRANSLATION_BACKEND=nllb
-#   export TRANSLATION_MODEL=facebook/nllb-200-1.3B
+#   export TRANSLATION_MODEL=facebook/nllb-200-distilled-600M
 #   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-#   CUDA_VISIBLE_DEVICES=2 python bot_local_translate.py
+#   CUDA_VISIBLE_DEVICES=1 python bot_local_translate.py
+#
+# For stronger model if GPU is free:
+#   export TRANSLATION_MODEL=facebook/nllb-200-1.3B
 
 import os
 
-# Prevent Transformers from trying to load TensorFlow / vision extras.
-# These must be set before importing transformers.
+# Prevent Transformers from trying to load TensorFlow / Flax.
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
@@ -33,15 +39,13 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
 from dotenv import load_dotenv
 from gtts import gTTS
-
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-# Load environment variables from .env file
-load_dotenv()
+# -----------------------------
+# Environment / config
+# -----------------------------
 
-# -----------------------------
-# Configuration
-# -----------------------------
+load_dotenv()
 
 API_TOKEN = os.getenv("API_TOKEN")
 
@@ -49,19 +53,16 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_NAME = os.getenv("DB_NAME", str(BASE_DIR / "ielts_bot.db"))
 
 TRANSLATION_BACKEND = os.getenv("TRANSLATION_BACKEND", "nllb").strip().lower()
-TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "facebook/nllb-200-1.3B").strip()
+TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "facebook/nllb-200-distilled-600M").strip()
 
-# Translation language settings
 NLLB_SOURCE_LANG = os.getenv("NLLB_SOURCE_LANG", "eng_Latn")
 NLLB_TARGET_LANG = os.getenv("NLLB_TARGET_LANG", "arb_Arab")
 MADLAD_TARGET_TAG = os.getenv("MADLAD_TARGET_TAG", "<2ar>")
 
-# Generation settings
 MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "512"))
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 NUM_BEAMS = int(os.getenv("NUM_BEAMS", "4"))
 
-# Optional: set to 1 if you want to skip preloading at startup
 LAZY_LOAD_TRANSLATOR = os.getenv("LAZY_LOAD_TRANSLATOR", "0").strip() == "1"
 
 logging.basicConfig(
@@ -93,18 +94,15 @@ def column_exists(cursor: sqlite3.Cursor, table_name: str, column_name: str) -> 
     return any(row[1] == column_name for row in cursor.fetchall())
 
 
-def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,),
-    )
-    return cursor.fetchone() is not None
+def add_column_if_missing(cursor: sqlite3.Cursor, table_name: str, column_name: str, ddl: str):
+    if not column_exists(cursor, table_name, column_name):
+        logging.info("Adding missing column %s.%s", table_name, column_name)
+        cursor.execute(ddl)
 
 
 def init_db():
     """
-    Makes the database compatible with this bot without deleting existing data.
-    It creates missing tables and adds words_per_day if missing.
+    Upgrades your existing DB safely without deleting data.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -118,8 +116,12 @@ def init_db():
         """
     )
 
-    if not column_exists(cursor, "users", "words_per_day"):
-        cursor.execute("ALTER TABLE users ADD COLUMN words_per_day INTEGER DEFAULT 5")
+    add_column_if_missing(
+        cursor,
+        "users",
+        "words_per_day",
+        "ALTER TABLE users ADD COLUMN words_per_day INTEGER DEFAULT 5",
+    )
 
     cursor.execute(
         """
@@ -127,22 +129,22 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             word TEXT NOT NULL,
             english_def TEXT,
+            english_def_arabic TEXT,
             arabic_meaning TEXT,
             example_sentence TEXT,
+            example_sentence_arabic TEXT,
             status TEXT DEFAULT 'new'
         )
         """
     )
 
-    # Safety upgrades for older DB versions
-    for col, ddl in {
-        "english_def": "ALTER TABLE words ADD COLUMN english_def TEXT",
-        "arabic_meaning": "ALTER TABLE words ADD COLUMN arabic_meaning TEXT",
-        "example_sentence": "ALTER TABLE words ADD COLUMN example_sentence TEXT",
-        "status": "ALTER TABLE words ADD COLUMN status TEXT DEFAULT 'new'",
-    }.items():
-        if not column_exists(cursor, "words", col):
-            cursor.execute(ddl)
+    # Upgrade older DB structure
+    add_column_if_missing(cursor, "words", "english_def", "ALTER TABLE words ADD COLUMN english_def TEXT")
+    add_column_if_missing(cursor, "words", "english_def_arabic", "ALTER TABLE words ADD COLUMN english_def_arabic TEXT")
+    add_column_if_missing(cursor, "words", "arabic_meaning", "ALTER TABLE words ADD COLUMN arabic_meaning TEXT")
+    add_column_if_missing(cursor, "words", "example_sentence", "ALTER TABLE words ADD COLUMN example_sentence TEXT")
+    add_column_if_missing(cursor, "words", "example_sentence_arabic", "ALTER TABLE words ADD COLUMN example_sentence_arabic TEXT")
+    add_column_if_missing(cursor, "words", "status", "ALTER TABLE words ADD COLUMN status TEXT DEFAULT 'new'")
 
     conn.commit()
     conn.close()
@@ -177,7 +179,14 @@ def get_daily_words(limit: int):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, word, english_def, arabic_meaning, example_sentence
+        SELECT
+            id,
+            word,
+            english_def,
+            english_def_arabic,
+            arabic_meaning,
+            example_sentence,
+            example_sentence_arabic
         FROM words
         WHERE COALESCE(status, 'new') = 'new'
         LIMIT ?
@@ -189,16 +198,35 @@ def get_daily_words(limit: int):
     return words
 
 
-def update_word_details(word_id: int, arabic: str, example: str):
+def update_word_learning_details(
+    word_id: int,
+    arabic_meaning: str,
+    english_def: str,
+    english_def_arabic: str,
+    example_sentence: str,
+    example_sentence_arabic: str,
+):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
         UPDATE words
-        SET arabic_meaning = ?, example_sentence = ?
+        SET
+            arabic_meaning = ?,
+            english_def = ?,
+            english_def_arabic = ?,
+            example_sentence = ?,
+            example_sentence_arabic = ?
         WHERE id = ?
         """,
-        (arabic, example, word_id),
+        (
+            arabic_meaning,
+            english_def,
+            english_def_arabic,
+            example_sentence,
+            example_sentence_arabic,
+            word_id,
+        ),
     )
     conn.commit()
     conn.close()
@@ -210,13 +238,12 @@ def update_word_details(word_id: int, arabic: str, example: str):
 
 class LocalTranslator:
     """
-    Local translator.
+    Local translator for English -> Arabic.
 
-    Important memory decision:
-    - Do NOT use device_map here for NLLB 1.3B on 24GB GPUs with your setup.
-    - Do NOT pass dtype=... because transformers 4.46.3 needs torch_dtype=...
-    - Load on CPU first, convert to FP16, then move once to CUDA.
-      This avoids the repeated OOM you saw during accelerate/device_map loading.
+    Notes for your server:
+    - Use CUDA_VISIBLE_DEVICES to choose a FREE GPU, e.g. CUDA_VISIBLE_DEVICES=1.
+    - With transformers 4.46.3 use torch_dtype, not dtype.
+    - This code avoids device_map because it caused OOM in your environment.
     """
 
     def __init__(self, backend: str, model_name: str):
@@ -234,35 +261,31 @@ class LocalTranslator:
         if self.backend not in {"nllb", "madlad"}:
             raise ValueError("TRANSLATION_BACKEND must be either 'nllb' or 'madlad'.")
 
-        # Load on CPU first.
-        # Keep use_safetensors=False for NLLB because your logs showed problematic
-        # safetensors/PR resolution attempts.
         load_kwargs = {
-    "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
-    "low_cpu_mem_usage": False,
+            "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
+            "low_cpu_mem_usage": False,
         }
 
         if self.backend == "nllb":
+            # This avoids the problematic safetensors PR path seen in your logs.
             load_kwargs["use_safetensors"] = False
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
                 self.model_name,
                 **load_kwargs,
             )
-
         else:
-            # Lazy import so NLLB users do not depend on T5 classes at startup.
             from transformers import T5ForConditionalGeneration, T5Tokenizer
-
             self.tokenizer = T5Tokenizer.from_pretrained(self.model_name)
             self.model = T5ForConditionalGeneration.from_pretrained(
                 self.model_name,
                 **load_kwargs,
             )
 
-        # Move once to GPU after loading.
         if self.device == "cuda":
-            logging.info("Moving FP16 model to CUDA...")
+            first_param = next(self.model.parameters())
+            logging.info("Model dtype before CUDA move: %s", first_param.dtype)
+            logging.info("Moving model to CUDA...")
             self.model = self.model.to(self.device)
         else:
             logging.warning("CUDA is not available. Running translation on CPU.")
@@ -275,7 +298,7 @@ class LocalTranslator:
         return {k: v.to(self.device) for k, v in inputs.items()}
 
     def translate_en_to_ar(self, text: str) -> str:
-        text = (text or "").strip()
+        text = clean_text(text)
         if not text:
             return ""
 
@@ -285,7 +308,6 @@ class LocalTranslator:
         return self._translate_nllb_to_ar(text)
 
     def _translate_nllb_to_ar(self, text: str) -> str:
-        # NLLB language codes
         self.tokenizer.src_lang = NLLB_SOURCE_LANG
 
         inputs = self.tokenizer(
@@ -311,7 +333,6 @@ class LocalTranslator:
         return fix_ielts_terms(translated.strip())
 
     def _translate_madlad_to_ar(self, text: str) -> str:
-        # MADLAD uses target tag prefix, e.g. <2ar>
         input_text = f"{MADLAD_TARGET_TAG} {text}"
 
         inputs = self.tokenizer(
@@ -334,11 +355,11 @@ class LocalTranslator:
         return fix_ielts_terms(translated.strip())
 
 
+def clean_text(text: Optional[str]) -> str:
+    return " ".join((text or "").strip().split())
+
+
 def fix_ielts_terms(text: str) -> str:
-    """
-    Small post-processing layer for common IELTS translation issues.
-    Keep this conservative so it does not damage normal Arabic.
-    """
     replacements = {
         "إي إل تي إس": "الآيلتس",
         "إيلتس": "الآيلتس",
@@ -378,51 +399,165 @@ async def local_translate_en_to_ar(text: str) -> str:
 
 
 # -----------------------------
-# External helpers
+# Dictionary / examples
 # -----------------------------
 
-def fetch_dictionary_example(word: str) -> str:
-    example_sentence = "No example available in dictionary."
+def fetch_dictionary_definition_and_example(word: str) -> Tuple[str, str]:
+    """
+    Returns:
+      english_definition, english_example
+
+    Priority:
+    1. dictionaryapi.dev definition/example
+    2. fallback IELTS-style example
+    """
+    fallback_definition = ""
+    fallback_example = make_fallback_english_example(word)
 
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
         response = requests.get(url, timeout=8)
 
-        if response.status_code == 200:
-            data = response.json()
+        if response.status_code != 200:
+            return fallback_definition, fallback_example
 
-            if isinstance(data, list) and data:
-                for meaning in data[0].get("meanings", []):
-                    for definition in meaning.get("definitions", []):
-                        example = definition.get("example")
-                        if example:
-                            return example
+        data = response.json()
+        if not isinstance(data, list) or not data:
+            return fallback_definition, fallback_example
+
+        best_definition = ""
+        best_example = ""
+
+        for meaning in data[0].get("meanings", []):
+            for definition_obj in meaning.get("definitions", []):
+                definition_text = clean_text(definition_obj.get("definition"))
+                example_text = clean_text(definition_obj.get("example"))
+
+                if definition_text and not best_definition:
+                    best_definition = definition_text
+
+                if example_text and not best_example:
+                    best_example = example_text
+
+                if best_definition and best_example:
+                    return best_definition, best_example
+
+        return best_definition or fallback_definition, best_example or fallback_example
 
     except Exception as e:
         logging.error("Dictionary API error for %s: %s", word, e)
+        return fallback_definition, fallback_example
 
-    return example_sentence
+
+def make_fallback_english_example(word: str) -> str:
+    word = clean_text(word)
+    if not word:
+        return "This word is commonly used in academic English."
+
+    # A simple safe fallback when the dictionary API has no example.
+    return f"The student learned how to use the word '{word}' correctly in an IELTS sentence."
 
 
-async def fetch_translation_and_example(word: str) -> Tuple[str, str]:
+async def build_learning_card(
+    word: str,
+    english_def_from_db: Optional[str],
+    arabic_meaning_from_db: Optional[str],
+    english_def_arabic_from_db: Optional[str],
+    example_from_db: Optional[str],
+    example_arabic_from_db: Optional[str],
+) -> Tuple[str, str, str, str, str]:
     """
-    Replaces GoogleTranslator with the local model.
+    Builds:
+      arabic_meaning,
+      english_definition,
+      arabic_definition,
+      english_example,
+      arabic_example
     """
-    try:
-        arabic_meaning = await local_translate_en_to_ar(word)
-    except Exception as e:
-        logging.exception("Local translation error for %s: %s", word, e)
+    word = clean_text(word)
+
+    english_definition = clean_text(english_def_from_db)
+    english_example = clean_text(example_from_db)
+
+    if not english_definition or not english_example:
+        fetched_definition, fetched_example = await asyncio.to_thread(
+            fetch_dictionary_definition_and_example,
+            word,
+        )
+
+        if not english_definition and fetched_definition:
+            english_definition = fetched_definition
+
+        if not english_example and fetched_example:
+            english_example = fetched_example
+
+    if not english_definition:
+        english_definition = "No English definition available."
+
+    if not english_example:
+        english_example = make_fallback_english_example(word)
+
+    arabic_meaning = clean_text(arabic_meaning_from_db)
+    arabic_definition = clean_text(english_def_arabic_from_db)
+    arabic_example = clean_text(example_arabic_from_db)
+
+    translation_tasks = []
+
+    if not arabic_meaning:
+        translation_tasks.append(("word", local_translate_en_to_ar(word)))
+
+    if not arabic_definition and english_definition != "No English definition available.":
+        translation_tasks.append(("definition", local_translate_en_to_ar(english_definition)))
+
+    if not arabic_example:
+        translation_tasks.append(("example", local_translate_en_to_ar(english_example)))
+
+    if translation_tasks:
+        results = await asyncio.gather(
+            *(task for _, task in translation_tasks),
+            return_exceptions=True,
+        )
+
+        for (name, _), result in zip(translation_tasks, results):
+            if isinstance(result, Exception):
+                logging.error("Translation failed for %s/%s: %s", name, word, result)
+                translated_text = "Translation unavailable"
+            else:
+                translated_text = clean_text(str(result))
+
+            if name == "word":
+                arabic_meaning = translated_text
+            elif name == "definition":
+                arabic_definition = translated_text
+            elif name == "example":
+                arabic_example = translated_text
+
+    if not arabic_meaning:
         arabic_meaning = "Translation unavailable"
 
-    example_sentence = await asyncio.to_thread(fetch_dictionary_example, word)
+    if not arabic_definition:
+        arabic_definition = "Translation unavailable"
 
-    return arabic_meaning, example_sentence
+    if not arabic_example:
+        arabic_example = "Translation unavailable"
 
+    return (
+        arabic_meaning,
+        english_definition,
+        arabic_definition,
+        english_example,
+        arabic_example,
+    )
+
+
+# -----------------------------
+# Audio
+# -----------------------------
 
 async def generate_and_send_audio(chat_id: int, word: str):
     """
     Generate English pronunciation using gTTS.
-    This still uses Google's TTS service online. It is separate from translation.
+    Translation is local, but gTTS itself is still an online Google TTS service.
     """
     filename = None
 
@@ -468,7 +603,7 @@ async def cmd_start(message: types.Message):
         "Welcome to the IELTS Vocabulary System.\n"
         "Default setting: 5 words per day.\n\n"
         "Commands:\n"
-        "/study - Get your words for today\n"
+        "/study - Get your IELTS words for today\n"
         "/set_words <number> - Change daily word count\n"
         "/translate <text> - Translate English text to Arabic locally"
     )
@@ -520,30 +655,59 @@ async def cmd_study(message: types.Message):
         await message.answer("No new words available in the database.")
         return
 
-    await message.answer(f"Fetching your {len(words)} words for today...")
+    await message.answer(f"Fetching your {len(words)} IELTS words for today...")
 
     for row in words:
-        word_id, word_text, english_def, arabic_meaning, example_sentence = row
+        (
+            word_id,
+            word_text,
+            english_def,
+            english_def_arabic,
+            arabic_meaning,
+            example_sentence,
+            example_sentence_arabic,
+        ) = row
 
+        word_text = clean_text(word_text)
         if not word_text:
             continue
 
-        if not arabic_meaning or not example_sentence:
-            arabic_meaning, example_sentence = await fetch_translation_and_example(word_text)
-            update_word_details(word_id, arabic_meaning, example_sentence)
+        (
+            arabic_meaning,
+            english_def,
+            english_def_arabic,
+            example_sentence,
+            example_sentence_arabic,
+        ) = await build_learning_card(
+            word=word_text,
+            english_def_from_db=english_def,
+            arabic_meaning_from_db=arabic_meaning,
+            english_def_arabic_from_db=english_def_arabic,
+            example_from_db=example_sentence,
+            example_arabic_from_db=example_sentence_arabic,
+        )
+
+        update_word_learning_details(
+            word_id=word_id,
+            arabic_meaning=arabic_meaning,
+            english_def=english_def,
+            english_def_arabic=english_def_arabic,
+            example_sentence=example_sentence,
+            example_sentence_arabic=example_sentence_arabic,
+        )
 
         msg_text = (
             f"Word: {word_text}\n"
-            f"Arabic: {arabic_meaning or 'Translation unavailable'}\n"
-            f"Definition: {english_def or 'No definition available.'}\n"
-            f"Example: {example_sentence or 'No example available.'}"
+            f"Arabic Meaning: {arabic_meaning}\n\n"
+            f"English Definition:\n{english_def}\n\n"
+            f"Arabic Definition:\n{english_def_arabic}\n\n"
+            f"English Example:\n{example_sentence}\n\n"
+            f"Arabic Example:\n{example_sentence_arabic}"
         )
 
         await message.answer(msg_text)
-
         await generate_and_send_audio(user_id, word_text)
 
-        # Pause briefly to prevent Telegram API limits
         await asyncio.sleep(1.5)
 
 
@@ -567,9 +731,6 @@ async def main():
     init_db()
 
     if not LAZY_LOAD_TRANSLATOR:
-        # Preload translator before polling, so first user request is not delayed.
-        # If you want faster bot startup, run with:
-        #   export LAZY_LOAD_TRANSLATOR=1
         await get_translator()
 
     await dp.start_polling(bot)
