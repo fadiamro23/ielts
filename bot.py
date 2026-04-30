@@ -114,25 +114,25 @@ def fetch_and_translate_sync(word, english_def):
     except Exception as e:
         logging.error(f"Dictionary API error for '{word}': {e}")
 
-    # 2. Translate and Generate via Groq API
+    # 2. Translate and Generate via Groq API (Strict Mode)
     try:
         prompt = f"""
-        أنت أستاذ لغة إنجليزية محترف متخصص في مساعدة الطلاب لاجتياز اختبار IELTS.
+        أنت مترجم أكاديمي محترف وخبير في اختبار IELTS. لغتك الأم هي العربية الفصحى.
         
         الكلمة الإنجليزية: {word}
         التعريف الإنجليزي: {english_def}
         المثال من القاموس: {example_sentence_en}
 
-        المطلوب بدقة:
-        1. ترجمة الكلمة إلى اللغة العربية بأدق معنى أكاديمي لها.
-        2. إذا كان "المثال من القاموس" هو "No example available in dictionary."، قم أنت بتأليف مثال إنجليزي أكاديمي قوي ومناسب لاختبار IELTS يحتوي على الكلمة المعنية، ثم ترجمه للعربية.
-        3. إذا كان هناك مثال حقيقي من القاموس، فقم بترجمته فقط.
+        المطلوب بدقة تامة:
+        1. ترجمة الكلمة إلى اللغة العربية الفصحى بأدق معنى أكاديمي لها.
+        2. إذا كان "المثال من القاموس" هو "No example available in dictionary."، قم بتأليف مثال إنجليزي أكاديمي قوي. وإذا كان هناك مثال، استخدمه كما هو.
+        3. ترجمة المثال الإنجليزي إلى لغة عربية فصحى سليمة 100%، خالية من أي أخطاء إملائية، وبدون استخدام أي رموز غريبة أو لغات أخرى.
         
         يجب أن يكون المخرج بصيغة JSON حصراً بهذا الشكل:
         {{
             "arabic_meaning": "ترجمة الكلمة هنا",
-            "example_en": "المثال الإنجليزي النهائي (سواء من القاموس أو من تأليفك)",
-            "example_ar": "ترجمة المثال هنا"
+            "example_en": "المثال الإنجليزي هنا",
+            "example_ar": "ترجمة المثال بلغة عربية نقية وصحيحة"
         }}
         """
 
@@ -140,7 +140,7 @@ def fetch_and_translate_sync(word, english_def):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a translation API that outputs valid JSON only."
+                    "content": "You are a highly accurate English-to-Arabic translator. You output strict JSON and perfect Arabic text without any foreign characters or hallucinations."
                 },
                 {
                     "role": "user",
@@ -148,6 +148,7 @@ def fetch_and_translate_sync(word, english_def):
                 }
             ],
             model="llama-3.3-70b-versatile",
+            temperature=0.2, # إجبار النموذج على الدقة المطلقة ومنع الهلوسة
             response_format={"type": "json_object"},
         )
         
