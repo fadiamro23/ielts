@@ -9,7 +9,10 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile
 from dotenv import load_dotenv
-import google.generativeai as genai
+
+# استدعاء مكتبة جوجل الجديدة
+from google import genai
+from google.genai import types as genai_types
 
 # Load environment variables
 load_dotenv()
@@ -25,13 +28,8 @@ if not API_TOKEN or not GEMINI_API_KEY:
     logging.error("API_TOKEN or GEMINI_API_KEY is not set. Please check your .env file.")
     exit(1)
 
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-# Using flash model for high speed and enabling JSON response format
-llm_model = genai.GenerativeModel(
-    'gemini-1.5-flash',
-    generation_config={"response_mime_type": "application/json"}
-)
+# Configure the new Gemini Client
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -97,14 +95,14 @@ def update_word_details(word_id, arabic, example_en, example_ar):
     conn.close()
 
 # ---------------------------------------------------------
-# Translation & API Logic via Gemini
+# Translation & API Logic via Gemini (New SDK)
 # ---------------------------------------------------------
 def fetch_and_translate_sync(word, english_def):
     """
-    Fetches an English example via API, then uses Google Gemini 
+    Fetches an English example via API, then uses the new Google GenAI SDK
     to translate the word and the example accurately based on context.
     """
-    # 1. Fetch Example from API
+    # 1. Fetch Example from Free Dictionary API
     example_sentence_en = "No example available in dictionary."
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
@@ -121,7 +119,7 @@ def fetch_and_translate_sync(word, english_def):
     except Exception as e:
         logging.error(f"Dictionary API error for '{word}': {e}")
 
-    # 2. Translate using Gemini
+    # 2. Translate using Gemini (New SDK Format)
     try:
         prompt = f"""
         أنت أستاذ لغة إنجليزية محترف متخصص في مساعدة الطلاب لاجتياز اختبار IELTS.
@@ -141,7 +139,14 @@ def fetch_and_translate_sync(word, english_def):
         }}
         """
 
-        response = llm_model.generate_content(prompt)
+        # Using the standard model for structured translation
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+            )
+        )
         
         # Parse JSON
         result = json.loads(response.text)
@@ -172,6 +177,7 @@ async def generate_and_send_audio(chat_id, word):
         os.remove(filename) 
     except Exception as e:
         logging.error(f"Error generating audio for '{word}': {e}")
+
 
 # ---------------------------------------------------------
 # Bot Handlers & Commands
@@ -222,7 +228,7 @@ async def cmd_study(message: types.Message):
         example_ar = w[5]
         
         # Translate if not already translated
-        if not arabic_meaning or not example_en or not example_ar:
+        if not arabic_meaning or not example_en or not example_ar or arabic_meaning == "خطأ في الترجمة":
             arabic_meaning, example_en, example_ar = await asyncio.to_thread(fetch_and_translate_sync, word_text, english_def)
             update_word_details(word_id, arabic_meaning, example_en, example_ar)
         
